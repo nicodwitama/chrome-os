@@ -1,0 +1,183 @@
+name: Build Brunch ChromeOS Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      recovery_url:
+        description: 'URL ChromeOS Recovery Image (.zip atau .bin)'
+        required: true
+        type: string
+        default: 'https://dl.google.com/dl/edgedl/chromeos/recovery/chromeos_16805.31.0_zork_recovery_stable-channel_ZorkMPKeys-v15.bin.zip'
+      brunch_url:
+        description: 'URL Brunch Release (.tar.gz)'
+        required: false
+        type: string
+        default: 'https://github.com/sebanc/brunch/releases/download/r152-stable-20260913/brunch_r152_stable_20260913.tar.gz'
+      image_size:
+        description: 'Ukuran image disk dalam GB (minimal 14)'
+        required: true
+        type: string
+        default: '14'
+      compression:
+        description: 'Format Kompresi Output'
+        required: true
+        type: choice
+        options:
+          - '7z'
+          - 'zip'
+        default: '7z'
+      create_release:
+        description: 'Buat GitHub Release untuk download langsung?'
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    name: Build ChromeOS Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Maximize Runner Disk Space
+        run: |
+          echo "=== Disk space before cleanup ==="
+          df -h
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          echo "=== Disk space after cleanup ==="
+          df -h
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cgpt pv p7zip-full zstd tar unzip wget curl gdisk
+
+      - name: Download and Extract Brunch Framework
+        run: |
+          mkdir -p workspace
+          cd workspace
+          
+          BRUNCH_URL="${{ inputs.brunch_url }}"
+          if [ -z "$BRUNCH_URL" ]; then
+            BRUNCH_URL="https://github.com/sebanc/brunch/releases/download/r152-stable-20260913/brunch_r152_stable_20260913.tar.gz"
+          fi
+          
+          echo "Downloading Brunch from: $BRUNCH_URL"
+          wget -q --show-progress "$BRUNCH_URL" -O brunch.tar.gz
+          tar -xvf brunch.tar.gz
+          ls -lh
+
+      - name: Download and Extract ChromeOS Recovery Image
+        run: |
+          cd workspace
+          RECOVERY_URL="${{ inputs.recovery_url }}"
+          echo "Downloading ChromeOS Recovery from: $RECOVERY_URL"
+          
+          # Download file
+          wget -q --show-progress "$RECOVERY_URL" -O recovery_download
+          
+          # Check file type and extract
+          FILE_TYPE=$(file -b recovery_download)
+          echo "Downloaded file type: $FILE_TYPE"
+          
+          if [[ "$FILE_TYPE" == *"Zip"* ]] || [[ "$RECOVERY_URL" == *.zip ]]; then
+            echo "Extracting ZIP archive..."
+            unzip recovery_download
+            rm -f recovery_download
+            # Rename extracted bin file to chromeos.bin
+            EXTRACTED_BIN=$(ls -1 *.bin | head -n 1)
+            if [ -n "$EXTRACTED_BIN" ] && [ "$EXTRACTED_BIN" != "chromeos.bin" ]; then
+              mv "$EXTRACTED_BIN" chromeos.bin
+            fi
+          elif [[ "$FILE_TYPE" == *"gzip"* ]] || [[ "$RECOVERY_URL" == *.gz ]]; then
+            echo "Extracting GZ archive..."
+            gunzip -c recovery_download > chromeos.bin
+            rm -f recovery_download
+          else
+            mv recovery_download chromeos.bin
+          fi
+          
+          echo "ChromeOS bin file ready:"
+          ls -lh chromeos.bin
+
+      - name: Build ChromeOS Image with Brunch
+        run: |
+          cd workspace
+          chmod +x chromeos-install.sh
+          
+          echo "Starting ChromeOS build..."
+          echo "Image Size: ${{ inputs.image_size }} GB"
+          
+          sudo bash chromeos-install.sh \
+            -src chromeos.bin \
+            -dst chromeos.img \
+            -s ${{ inputs.image_size }}
+          
+          echo "Build finished! Checking files:"
+          ls -lh chromeos.img
+
+      - name: Compress Output Image
+        run: |
+          cd workspace
+          COMPRESSION="${{ inputs.compression }}"
+          
+          echo "Compressing chromeos.img with $COMPRESSION..."
+          if [ "$COMPRESSION" = "7z" ]; then
+            7z a -mx=3 -mmt=on chromeos.img.7z chromeos.img
+            rm -f chromeos.img
+            echo "OUTPUT_FILE=workspace/chromeos.img.7z" >> $GITHUB_ENV
+            echo "OUTPUT_NAME=chromeos.img.7z" >> $GITHUB_ENV
+          else
+            7z a -tzip -mx=3 -mmt=on chromeos.img.zip chromeos.img
+            rm -f chromeos.img
+            echo "OUTPUT_FILE=workspace/chromeos.img.zip" >> $GITHUB_ENV
+            echo "OUTPUT_NAME=chromeos.img.zip" >> $GITHUB_ENV
+          fi
+          
+          if [ -f "chromeos.img.grub.txt" ]; then
+            cp chromeos.img.grub.txt ../grub_config.txt || true
+          fi
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.OUTPUT_NAME }}
+          path: ${{ env.OUTPUT_FILE }}
+          retention-days: 7
+
+      - name: Upload GRUB Configuration Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: grub_config
+          path: workspace/*.grub.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Create GitHub Release
+        if: ${{ inputs.create_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Brunch ChromeOS Build #${{ github.run_number }}
+          body: |
+            ## ChromeOS Brunch Image Build (Ryzen / Zork)
+            - **Build Number**: #${{ github.run_number }}
+            - **Image Size**: ${{ inputs.image_size }} GB
+            - **Recovery URL**: ${{ inputs.recovery_url }}
+            - **Brunch URL**: ${{ inputs.brunch_url }}
+            
+            ### Cara Menggunakan:
+            1. Download file `${{ env.OUTPUT_NAME }}` di bawah.
+            2. Ekstrak file hingga menjadi `chromeos.img`.
+            3. Flash ke flashdisk (min 16GB) menggunakan **BalenaEtcher**, atau gunakan untuk dual-boot.
+          files: |
+            ${{ env.OUTPUT_FILE }}
+            workspace/*.grub.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

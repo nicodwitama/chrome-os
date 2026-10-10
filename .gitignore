@@ -1,0 +1,9 @@
+# Large binary files (do not push to git due to 100MB GitHub limit)
+*.bin
+*.img
+*.iso
+*.7z
+*.zip
+*.tar.gz
+*.tar.zst
+*.grub.txt
